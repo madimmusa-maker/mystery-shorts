@@ -5,6 +5,9 @@ import random
 from .util import log, media_duration, run
 
 W, H, FPS = 1080, 1920, 30
+# Призрак: верх холста. Субтитры по центру y=860, две строки занимают ~740–980,
+# так что призрак (1140–1560) их не перекрывает и остаётся выше интерфейса Shorts.
+GHOST_TOP = 1140
 LOOK = ("eq=brightness=-0.07:contrast=1.08:saturation=0.70,"
         "colorbalance=bs=0.05:bm=0.03:rh=-0.02,"
         "vignette=angle=PI/4.2")
@@ -49,7 +52,8 @@ def _render_segment(src, src_dur, length, out, zoom_in):
     run(cmd)
 
 
-def build(clips, voice_path, music_path, ass_path, out_path, total, voice_delay, workdir):
+def build(clips, voice_path, music_path, ass_path, out_path, total, voice_delay, workdir,
+          ghost_path=None):
     durs = []
     for c in clips:
         try:
@@ -76,8 +80,14 @@ def build(clips, voice_path, music_path, ass_path, out_path, total, voice_delay,
          "-i", "segments.txt", "-c", "copy", "base.mp4"], cwd=workdir)
 
     ms = int(voice_delay * 1000)
+    if ghost_path:
+        ghost_in = ["-i", os.path.abspath(ghost_path)]
+        vchain = (f"[3:v]format=rgba[gh];[0:v][gh]overlay=x=(W-w)/2:y={GHOST_TOP}:"
+                  f"eof_action=pass:format=auto[bg0];[bg0]")
+    else:
+        ghost_in, vchain = [], "[0:v]"
     graph = (
-        f"[0:v]ass={os.path.basename(ass_path)},"
+        f"{vchain}ass={os.path.basename(ass_path)},"
         f"fade=t=in:st=0:d=0.4,fade=t=out:st={total - 0.6:.2f}:d=0.6[v];"
         f"[1:a]aformat=channel_layouts=stereo,adelay={ms}|{ms},"
         f"acompressor=threshold=-18dB:ratio=3:attack=5:release=120,volume=1.6[voice];"
@@ -87,7 +97,7 @@ def build(clips, voice_path, music_path, ass_path, out_path, total, voice_delay,
     )
     run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-i", "base.mp4", "-i", os.path.abspath(voice_path), "-i", os.path.abspath(music_path),
-         "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+         *ghost_in, "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
          "-t", f"{total:.2f}", "-r", str(FPS),
          "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
          "-profile:v", "high", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",

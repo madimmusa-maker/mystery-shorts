@@ -3,6 +3,8 @@ import subprocess
 
 MAX_WORDS = 3
 MAX_CHARS = 16
+CENTER_Y = 860  # центр строки субтитров; призрак рисуется ниже (см. video.GHOST_TOP)
+POS = f"{{\\an5\\pos(540,{CENTER_Y})}}"
 
 
 def pick_font():
@@ -34,7 +36,7 @@ def _chunks(words):
         if cur:
             gap = w[0] - cur[-1][1]
             length = sum(len(x[2]) + 1 for x in cur) + len(w[2])
-            if len(cur) >= MAX_WORDS or length > MAX_CHARS or gap > 0.35:
+            if len(cur) >= MAX_WORDS or length > MAX_CHARS or gap > 0.18:
                 chunks.append(cur)
                 cur = []
         cur.append(w)
@@ -70,17 +72,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             parts = []
             for wj, other in enumerate(chunk):
                 txt = _esc(other[2].upper())
-                if wj == wi:
-                    parts.append("{\\1a&H00&}" + txt)
-                else:
-                    parts.append("{\\1a&H70&}" + txt)
+                if wj < wi:      # уже прозвучали
+                    parts.append("{\\alpha&H00&\\1a&H40&}" + txt)
+                elif wj == wi:   # звучит сейчас
+                    parts.append("{\\alpha&H00&}" + txt)
+                else:            # ещё не прозвучали: невидимы, но держат место в строке
+                    parts.append("{\\alpha&HFF&}" + txt)
             pop = "{\\fscx108\\fscy108\\t(0,90,\\fscx100\\fscy100)}" if wi == 0 else ""
             s, e = start + offset, end + offset
             if total:
                 e = min(e, total - 0.05)
             if e - s < 0.04:
                 continue
-            lines.append(f"Dialogue: 0,{_ts(s)},{_ts(e)},Main,,0,0,0,,{pop}{' '.join(parts)}")
+            lines.append(f"Dialogue: 0,{_ts(s)},{_ts(e)},Main,,0,0,0,,{POS}{pop}{' '.join(parts)}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(header + "\n".join(lines) + "\n")
     return font

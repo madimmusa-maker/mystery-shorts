@@ -1,23 +1,49 @@
-"""Озвучка: edge-tts (ru-RU-DmitryNeural) с таймингом слов, запасной вариант — gTTS.
+"""Живая озвучка по фразам + точные тайминги слов.
 
-Если edge-tts не работает (например, NoAudioReceived на серверах GitHub),
-текст озвучивается через gTTS (Google, русский), а тайминги слов
-рассчитываются примерно — по длине слов и паузам на знаках препинания.
+Каждая фраза озвучивается отдельно со своей скоростью и высотой голоса
+(в зависимости от настроения фразы), затем фразы склеиваются с паузами.
+Мы сами собираем итоговый звук, поэтому точно знаем, где начинается каждая
+фраза, и сдвигаем на это место тайминги слов из WordBoundary edge-tts.
+
+Если edge-tts не работает, фразы озвучиваются gTTS, а тайминги слов
+берутся из faster-whisper (см. align.py) или, в крайнем случае, считаются
+примерно внутри каждой фразы.
 """
 import asyncio
 import os
+import random
 import re
+import subprocess
+import wave
 
 import edge_tts
+import numpy as np
 
-from .util import log, media_duration, retry, run
+from . import align
+from .util import log, retry
 
 VOICE = "ru-RU-DmitryNeural"
+SR = 24000
 
-# После первой неудачи edge-tts в этом запуске сразу идём в gTTS,
-# чтобы не тратить время на повторы при подборе скорости речи.
+# настроение фразы -> (скорость %, высота Гц)
+PROSODY = {
+    "hook": (-6, -2),
+    "intrigue": (-14, -6),
+    "fact": (-8, -2),
+    "surprise": (6, 4),
+    "question": (-6, 3),
+    "reveal": (-12, -5),
+}
+DEFAULT_MOOD = "fact"
+PAUSE_MIN, PAUSE_MAX = 0.20, 0.40
+PAUSE_BEFORE_REVEAL = 0.80
+EDGE_LAG = 0.02  # маленький запас: слово появляется на 20 мс позже начала звука, а не раньше
+
+# После первой неудачи edge-tts в этом запуске сразу идём в gTTS.
 _edge_broken = False
 
+
+# ---------- форматы ----------
 
 def fmt_rate(value):
     """'-8%', '-8', -8, '8%' -> '-8%' / '+8%' (формат, который требует edge-tts)."""
@@ -35,16 +61,63 @@ def fmt_pitch(value):
     return f"{m.group(1) or '+'}{int(m.group(2))}Hz"
 
 
-def rate_to_tempo(rate):
-    """'-8%' -> 0.92 (множитель скорости для ffmpeg atempo)."""
-    pct = int(fmt_rate(rate).rstrip("%"))
-    return max(0.5, min(2.0, 1 + pct / 100))
-
-
 def clean_for_speech(text):
     text = re.sub(r"[«»\"“”„*_#<>\[\]{}|~^&]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def display_tokens(text):
+    """Слова фразы так, как они пойдут в субтитры (без знаков препинания)."""
+    out = []
+    for tok in text.split():
+        w = re.sub(r"[^\w\-]", "", tok).strip("-")
+        if w:
+            out.append(w)
+    return out
+
+
+# ---------- звук ----------
+
+def decode(path, tempo=1.0, semitones=0.0):
+    """Любой аудиофайл -> numpy float32 mono 24 кГц (с изменением темпа/тона)."""
+    filters = []
+    if abs(semitones) > 0.01:
+        f = 2 ** (semitones / 12)
+        filters += [f"asetrate={int(SR * f)}", f"aresample={SR}", f"atempo={1 / f:.4f}"]
+    if abs(tempo - 1) > 0.001:
+        filters.append(f"atempo={max(0.5, min(2.0, tempo)):.4f}")
+    cmd = ["ffmpeg", "-v", "error", "-i", path]
+    if filters:
+        cmd += ["-af", ",".join(filters)]
+    cmd += ["-f", "s16le", "-ac", "1", "-ar", str(SR), "-"]
+    res = subprocess.run(cmd, capture_output=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"ffmpeg decode failed: {res.stderr.decode()[-300:]}")
+    return np.frombuffer(res.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def sound_bounds(x):
+    """(начало, конец) звука в секундах — где громкость выше порога."""
+    win = int(SR * 0.01)
+    n = len(x) // win
+    if n == 0:
+        return 0.0, len(x) / SR
+    rms = np.sqrt((x[: n * win].reshape(n, win) ** 2).mean(axis=1) + 1e-12)
+    thr = max(rms.max() * 0.06, 10 ** (-48 / 20))
+    loud = np.nonzero(rms > thr)[0]
+    if len(loud) == 0:
+        return 0.0, len(x) / SR
+    return loud[0] * win / SR, (loud[-1] + 1) * win / SR
+
+
+def write_wav(path, x):
+    pcm = (np.clip(x, -1, 1) * 32767).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(pcm.tobytes())
 
 
 # ---------- edge-tts ----------
@@ -62,7 +135,7 @@ async def _edge(text, out_path, rate, pitch, boundary):
     return words
 
 
-def _edge_synth(text, out_path, rate, pitch):
+def _edge_phrase(text, out_path, rate, pitch):
     """Несколько вариантов запроса: обычный, без сдвига тона, без таймингов слов."""
     variants = [(rate, pitch, "WordBoundary"),
                 (rate, "+0Hz", "WordBoundary"),
@@ -80,78 +153,122 @@ def _edge_synth(text, out_path, rate, pitch):
     raise last
 
 
-# ---------- gTTS (запасной вариант) ----------
+# ---------- gTTS ----------
 
-def _gtts_synth(text, out_path, rate):
-    from gtts import gTTS  # импорт здесь: нужен только при запасном варианте
-
-    raw = out_path + ".gtts.mp3"
+def _gtts_phrase(text, out_path):
+    from gtts import gTTS  # нужен только в запасном варианте
 
     def go():
-        gTTS(text=text, lang="ru", tld="com", slow=False).save(raw)
-        if os.path.getsize(raw) < 1000:
+        gTTS(text=text, lang="ru", tld="com", slow=False).save(out_path)
+        if os.path.getsize(out_path) < 500:
             raise RuntimeError("gTTS вернул пустой звук")
     retry(go, attempts=4, delay=5, what="gTTS")
 
-    # gTTS не умеет менять скорость — делаем это ffmpeg; заодно обрезаем
-    # тишину в начале и в конце, чтобы тайминги субтитров были точнее.
-    tempo = rate_to_tempo(rate)
-    af = (f"silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,"
-          f"areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1,areverse,"
-          f"atempo={tempo:.3f}")
-    run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", raw,
-         "-af", af, "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "96k", out_path])
-    os.remove(raw)
+
+# ---------- сборка ----------
+
+def _prosody(mood, speed):
+    rate, pitch = PROSODY.get(mood, PROSODY[DEFAULT_MOOD])
+    rate += speed + random.randint(-2, 2)
+    pitch += random.randint(-1, 1)
+    return rate, pitch
 
 
-def estimate_words(text, duration, start=0.0):
-    """Примерные тайминги слов: пропорционально длине + паузы на знаках препинания."""
-    tokens = text.split()
-    if not tokens:
-        return []
-    weights = []
-    for tok in tokens:
-        w = len(re.sub(r"[^\w]", "", tok)) + 1.5
-        pause = 0.0
-        if re.search(r"[.!?…]$", tok):
-            pause = 5.0
-        elif re.search(r"[,;:—–-]$", tok):
-            pause = 2.5
-        weights.append((w, pause))
-    total = sum(w + p for w, p in weights)
-    scale = max(duration - start, 0.5) / total
-    t, out = start, []
-    for tok, (w, p) in zip(tokens, weights):
-        d = w * scale
-        word = re.sub(r"[^\w\-]", "", tok).strip("-")
-        if word:
-            out.append((t, t + d * 0.95, word))
-        t += d + p * scale
+def _render_phrases(phrases, workdir, speed, engine):
+    """Озвучить все фразы одним движком. Возвращает список (audio, words|None, text)."""
+    out = []
+    for i, ph in enumerate(phrases):
+        text = clean_for_speech(ph["text"])
+        rate, pitch = _prosody(ph.get("mood"), speed)
+        mp3 = os.path.join(workdir, f"phrase_{i:02d}.mp3")
+        if engine == "edge":
+            words = _edge_phrase(text, mp3, fmt_rate(rate), fmt_pitch(pitch))
+            audio = decode(mp3)
+        else:
+            _gtts_phrase(text, mp3)
+            # gTTS не умеет темп и тон — делаем это ffmpeg (голос Google ~200 Гц, поэтому /10)
+            audio = decode(mp3, tempo=1 + rate / 100, semitones=pitch / 10)
+            words = None
+        out.append((audio, words, text, ph.get("mood")))
     return out
 
 
-# ---------- общий вход ----------
+def synthesize(phrases, out_wav, workdir, speed=0, seed=None):
+    """Озвучить фразы и склеить их с паузами.
 
-def synthesize(text, out_path, rate="-8%", pitch="-2Hz"):
+    Возвращает (words, duration): words — список (начало, конец, слово) в секундах
+    от начала out_wav; слово никогда не начинается раньше, чем оно звучит.
+    """
     global _edge_broken
-    text = clean_for_speech(text)
-    rate, pitch = fmt_rate(rate), fmt_pitch(pitch)
-
-    words, engine = None, None
+    random.seed(seed)
+    engine = "edge"
+    rendered = None
     if not _edge_broken:
         try:
-            words = _edge_synth(text, out_path, rate, pitch)
-            engine = "edge-tts"
+            rendered = _render_phrases(phrases, workdir, speed, "edge")
         except Exception as e:  # noqa: BLE001
             _edge_broken = True
             log(f"TTS: edge-tts не сработал ({type(e).__name__}: {e}) — переключаюсь на gTTS")
-    if engine is None:
-        _gtts_synth(text, out_path, rate)
-        words, engine = [], "gTTS"
+    if rendered is None:
+        engine = "gtts"
+        rendered = _render_phrases(phrases, workdir, speed, "gtts")
 
-    duration = media_duration(out_path)
-    if len(words) < len(text.split()) * 0.5:
-        log("TTS: тайминги слов рассчитываются примерно")
-        words = estimate_words(text, duration)
-    log(f"TTS: {engine}, {duration:.1f}s, {len(words)} words, rate {rate}")
+    pieces, spans, per_phrase = [], [], []
+    pos = 0.0
+    for i, (audio, pw, text, mood) in enumerate(rendered):
+        if i > 0:
+            pause = PAUSE_BEFORE_REVEAL if mood == "reveal" else random.uniform(PAUSE_MIN, PAUSE_MAX)
+            pieces.append(np.zeros(int(SR * pause), dtype=np.float32))
+            pos += pause
+        on, off = sound_bounds(audio)
+        lead = max(on - 0.03, 0.0)
+        tail = min(off + 0.08, len(audio) / SR)
+        clip = audio[int(lead * SR): int(tail * SR)]
+        start_sound, end_sound = pos + (on - lead), pos + (off - lead)
+        spans.append((start_sound, end_sound))
+        if pw and len(pw) >= len(display_tokens(text)) * 0.6:
+            # если звук начался позже, чем говорит WordBoundary (задержка декодера),
+            # сдвигаем все слова фразы — субтитры не должны опережать голос
+            shift = max(0.0, on - pw[0][0]) + EDGE_LAG
+            per_phrase.append([(max(pos + s + shift - lead, start_sound),
+                                pos + e + shift - lead, w) for (s, e, w) in pw])
+        else:
+            per_phrase.append(None)
+        pieces.append(clip)
+        pos += len(clip) / SR
+
+    full = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float32)
+    peak = float(np.abs(full).max()) or 1.0
+    write_wav(out_wav, full * (0.89 / peak))
+    duration = len(full) / SR
+
+    missing = [i for i, w in enumerate(per_phrase) if w is None]
+    if missing:
+        fallback = _fallback_words(rendered, spans, out_wav)
+        for i in missing:
+            per_phrase[i] = fallback[i]
+        log(f"TTS: {len(missing)} phrases without WordBoundary timings")
+    words = _monotonic([w for ph in per_phrase for w in ph])
+    log(f"TTS: {engine}, {len(phrases)} phrases, {duration:.1f}s, {len(words)} words, speed {speed:+d}%")
     return words, duration
+
+
+def _fallback_words(rendered, spans, wav_path):
+    """Тайминги без WordBoundary: faster-whisper, иначе — примерная оценка внутри фраз."""
+    phrase_tokens = [display_tokens(t) for (_, _, t, _) in rendered]
+    wh = align.whisper_words(wav_path, " ".join(t for (_, _, t, _) in rendered))
+    if wh:
+        return align.align(phrase_tokens, spans, wh)
+    log("TTS: faster-whisper недоступен — тайминги слов считаются примерно по фразам")
+    rough = [align.estimate(toks, s, e) for toks, (s, e) in zip(phrase_tokens, spans)]
+    return align.snap_to_onsets(rough, wav_path, spans)
+
+
+def _monotonic(words):
+    out, last = [], 0.0
+    for s, e, w in sorted(words, key=lambda x: x[0]):
+        s = max(s, last)
+        e = max(e, s + 0.05)
+        out.append((s, e, w))
+        last = s
+    return out
