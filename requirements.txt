@@ -1,0 +1,4 @@
+requests>=2.31
+edge-tts>=7.0.0
+google-api-python-client>=2.100
+google-auth>=2.23
