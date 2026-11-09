@@ -8,7 +8,7 @@ import shutil
 import sys
 import traceback
 
-from shorts import gemini, music, pexels, subtitles, tts, video, youtube
+from shorts import gemini, music, pixabay, subtitles, tts, video, youtube
 from shorts.util import log
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -135,7 +135,7 @@ def main():
     voice, words, dur = voice_over(story, used)
 
     log("Step 3: stock clips")
-    clips = pexels.fetch_clips(story["keywords_en"], WORK)
+    clips = pixabay.fetch_clips(story["keywords_en"], WORK)
     total = min(dur + VOICE_DELAY + TAIL, MAX_TOTAL)
 
     log("Step 5: subtitles and music")
