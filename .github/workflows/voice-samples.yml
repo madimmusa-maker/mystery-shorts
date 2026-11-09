@@ -1,0 +1,50 @@
+name: Voice samples
+
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Фраза для озвучки (можно оставить пустым)"
+        type: string
+        default: ""
+
+jobs:
+  samples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python packages (including Silero / torch CPU)
+        run: |
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Cache Silero model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/silero
+          key: silero-v4_ru
+
+      - name: Make voice samples
+        env:
+          SAMPLE_TEXT: ${{ inputs.text }}
+        run: python voice_samples.py "$SAMPLE_TEXT"
+
+      - name: Save samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-samples
+          path: samples/
+          retention-days: 14

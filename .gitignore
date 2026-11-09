@@ -3,3 +3,5 @@ __pycache__/
 work/
 output/
 .env
+work_samples/
+samples/

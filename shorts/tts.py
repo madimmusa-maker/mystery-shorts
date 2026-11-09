@@ -19,10 +19,8 @@ import wave
 import edge_tts
 import numpy as np
 
-from . import align
+from . import align, voices
 from .util import log, retry
-
-VOICE = "ru-RU-DmitryNeural"
 SR = 24000
 
 # настроение фразы -> (скорость %, высота Гц)
@@ -39,8 +37,8 @@ PAUSE_MIN, PAUSE_MAX = 0.20, 0.40
 PAUSE_BEFORE_REVEAL = 0.80
 EDGE_LAG = 0.02  # маленький запас: слово появляется на 20 мс позже начала звука, а не раньше
 
-# После первой неудачи edge-tts в этом запуске сразу идём в gTTS.
-_edge_broken = False
+# Движки, которые уже сломались в этом запуске — к ним больше не обращаемся.
+_broken = set()
 
 
 # ---------- форматы ----------
@@ -122,8 +120,8 @@ def write_wav(path, x):
 
 # ---------- edge-tts ----------
 
-async def _edge(text, out_path, rate, pitch, boundary):
-    comm = edge_tts.Communicate(text, VOICE, rate=rate, pitch=pitch, boundary=boundary)
+async def _edge(text, out_path, rate, pitch, boundary, voice):
+    comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, boundary=boundary)
     words = []
     with open(out_path, "wb") as fh:
         async for chunk in comm.stream():
@@ -135,7 +133,7 @@ async def _edge(text, out_path, rate, pitch, boundary):
     return words
 
 
-def _edge_phrase(text, out_path, rate, pitch):
+def _edge_phrase(text, out_path, rate, pitch, voice):
     """Несколько вариантов запроса: обычный, без сдвига тона, без таймингов слов."""
     variants = [(rate, pitch, "WordBoundary"),
                 (rate, "+0Hz", "WordBoundary"),
@@ -143,7 +141,7 @@ def _edge_phrase(text, out_path, rate, pitch):
     last = None
     for r, p, b in variants:
         try:
-            words = retry(lambda r=r, p=p, b=b: asyncio.run(_edge(text, out_path, r, p, b)),
+            words = retry(lambda r=r, p=p, b=b: asyncio.run(_edge(text, out_path, r, p, b, voice)),
                           attempts=2, delay=4, what=f"edge-tts ({r}, {p}, {b})")
             if os.path.getsize(out_path) > 1000:
                 return words
@@ -174,44 +172,73 @@ def _prosody(mood, speed):
     return rate, pitch
 
 
-def _render_phrases(phrases, workdir, speed, engine):
-    """Озвучить все фразы одним движком. Возвращает список (audio, words|None, text)."""
+def _render_phrases(phrases, workdir, speed, engine, engine_voice, male):
+    """Озвучить все фразы одним движком. Возвращает список (audio, words|None, text, mood)."""
+    # сдвиг тона в Гц -> полутона: у мужского голоса (~120 Гц) 1 полутон ≈ 7 Гц, у женского ≈ 12 Гц
+    hz_per_semitone = 7 if male else 12
     out = []
     for i, ph in enumerate(phrases):
         text = clean_for_speech(ph["text"])
         rate, pitch = _prosody(ph.get("mood"), speed)
-        mp3 = os.path.join(workdir, f"phrase_{i:02d}.mp3")
+        base = os.path.join(workdir, f"phrase_{i:02d}")
         if engine == "edge":
-            words = _edge_phrase(text, mp3, fmt_rate(rate), fmt_pitch(pitch))
-            audio = decode(mp3)
+            words = _edge_phrase(text, base + ".mp3", fmt_rate(rate), fmt_pitch(pitch), engine_voice)
+            audio = decode(base + ".mp3")
+        elif engine == "silero":
+            from . import silero  # torch нужен только для Silero
+            silero.synth(text, engine_voice, base + ".wav")
+            # Silero не умеет менять темп и тон по фразам — делаем это ffmpeg
+            audio = decode(base + ".wav", tempo=1 + rate / 100, semitones=pitch / hz_per_semitone)
+            words = None
         else:
-            _gtts_phrase(text, mp3)
-            # gTTS не умеет темп и тон — делаем это ffmpeg (голос Google ~200 Гц, поэтому /10)
-            audio = decode(mp3, tempo=1 + rate / 100, semitones=pitch / 10)
+            _gtts_phrase(text, base + ".mp3")
+            audio = decode(base + ".mp3", tempo=1 + rate / 100, semitones=pitch / hz_per_semitone)
             words = None
         out.append((audio, words, text, ph.get("mood")))
     return out
 
 
-def synthesize(phrases, out_wav, workdir, speed=0, seed=None):
+def _engine_chain(voice, fallback):
+    """Выбранный голос, затем запасные: Дмитрий (edge-tts), затем gTTS."""
+    chain = [voice]
+    if fallback:
+        chain += [v for v in ("dmitry", "gtts") if v != voice]
+    return chain
+
+
+def synthesize(phrases, out_wav, workdir, speed=0, seed=None, voice=None, fallback=True,
+               precise_words=True):
     """Озвучить фразы и склеить их с паузами.
 
+    voice — имя из voices.VOICES (по умолчанию — из config.py / переменной VOICE).
+    fallback=False — не переключаться на другие голоса (для образцов голосов).
+    precise_words=False — не запускать faster-whisper (когда субтитры не нужны).
     Возвращает (words, duration): words — список (начало, конец, слово) в секундах
     от начала out_wav; слово никогда не начинается раньше, чем оно звучит.
     """
-    global _edge_broken
     random.seed(seed)
-    engine = "edge"
-    rendered = None
-    if not _edge_broken:
+    voice = voice or voices.selected()
+    rendered, engine = None, None
+    errors = []
+    for name in _engine_chain(voice, fallback):
+        if name in _broken:
+            continue
+        if name == "gtts":
+            eng, eng_voice, male = "gtts", None, False
+        else:
+            eng, eng_voice, _ = voices.VOICES[name]
+            male = name in voices.MALE
         try:
-            rendered = _render_phrases(phrases, workdir, speed, "edge")
+            rendered = _render_phrases(phrases, workdir, speed, eng, eng_voice, male)
+            engine = f"{eng}:{name}"
+            break
         except Exception as e:  # noqa: BLE001
-            _edge_broken = True
-            log(f"TTS: edge-tts не сработал ({type(e).__name__}: {e}) — переключаюсь на gTTS")
+            _broken.add(name)
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+            log(f"TTS: голос {name} не сработал ({type(e).__name__}: {e})"
+                + (" — пробую запасной" if fallback else ""))
     if rendered is None:
-        engine = "gtts"
-        rendered = _render_phrases(phrases, workdir, speed, "gtts")
+        raise RuntimeError("Ни один голос не сработал: " + " | ".join(errors))
 
     pieces, spans, per_phrase = [], [], []
     pos = 0.0
@@ -244,7 +271,7 @@ def synthesize(phrases, out_wav, workdir, speed=0, seed=None):
 
     missing = [i for i, w in enumerate(per_phrase) if w is None]
     if missing:
-        fallback = _fallback_words(rendered, spans, out_wav)
+        fallback = _fallback_words(rendered, spans, out_wav, use_whisper=precise_words)
         for i in missing:
             per_phrase[i] = fallback[i]
         log(f"TTS: {len(missing)} phrases without WordBoundary timings")
@@ -253,10 +280,10 @@ def synthesize(phrases, out_wav, workdir, speed=0, seed=None):
     return words, duration
 
 
-def _fallback_words(rendered, spans, wav_path):
+def _fallback_words(rendered, spans, wav_path, use_whisper=True):
     """Тайминги без WordBoundary: faster-whisper, иначе — примерная оценка внутри фраз."""
     phrase_tokens = [display_tokens(t) for (_, _, t, _) in rendered]
-    wh = align.whisper_words(wav_path, " ".join(t for (_, _, t, _) in rendered))
+    wh = align.whisper_words(wav_path, " ".join(t for (_, _, t, _) in rendered)) if use_whisper else None
     if wh:
         return align.align(phrase_tokens, spans, wh)
     log("TTS: faster-whisper недоступен — тайминги слов считаются примерно по фразам")

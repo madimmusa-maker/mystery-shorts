@@ -40,6 +40,23 @@ jobs:
       - name: Install Python packages
         run: pip install -r requirements.txt
 
+      - name: Install Silero (only if a Silero voice is chosen)
+        env:
+          VOICE: ${{ vars.VOICE }}
+        run: |
+          if python -m shorts.voices --needs-silero; then
+            echo "Silero voice selected: $(python -m shorts.voices)"
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            echo "edge-tts voice selected: $(python -m shorts.voices)"
+          fi
+
+      - name: Cache Silero model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/silero
+          key: silero-v4_ru
+
       # модель faster-whisper (нужна только если edge-tts не сработал) — кэшируем
       - name: Cache whisper model
         uses: actions/cache@v4
@@ -52,6 +69,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          VOICE: ${{ vars.VOICE }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}

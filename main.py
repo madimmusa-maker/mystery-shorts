@@ -8,7 +8,7 @@ import shutil
 import sys
 import traceback
 
-from shorts import gemini, ghost, music, pixabay, subtitles, tts, video, youtube
+from shorts import gemini, ghost, music, pixabay, subtitles, tts, video, voices, youtube
 from shorts.util import log
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -164,7 +164,7 @@ def main():
     for p in story["phrases"]:
         log(f"  [{p['mood']}] {p['text']}")
 
-    log("Step 4: voice")
+    log(f"Step 4: voice ({voices.selected()})")
     voice, words, dur = voice_over(story, used)
 
     log("Step 3: stock clips")
